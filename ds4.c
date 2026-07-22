@@ -56096,7 +56096,7 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
 
 int ds4_engine_model_id(ds4_engine *e) {
     (void)e;
-    return (int)DS4_MODEL_VARIANT;
+    return 0;
 }
 
 /* Decode gate firing schedule for the TP transport (see ds4_tp_identity):
@@ -56547,6 +56547,33 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 free(s);
                 return 1;
             }
+        }
+        if (!ds4_session_tp_register(s)) {
+            ds4_session_free(s);
+            return 1;
+        }
+        *out = s;
+        return 0;
+    }
+    if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
+        /* Coordinator: skip full graph allocation, only create distributed session */
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
+        char err[256];
+        if (ds4_dist_session_create(&s->distributed,
+                                    e,
+                                    &e->distributed,
+                                    s,
+                                    ctx_size,
+                                    err,
+                                    sizeof(err)) != 0) {
+            fprintf(stderr,
+                    "ds4: failed to create distributed coordinator session: %s\n",
+                    err[0] ? err : "unknown error");
+            free(s->logits);
+            free(s->sample_probs);
+            free(s);
+            return 1;
         }
         if (!ds4_session_tp_register(s)) {
             ds4_session_free(s);

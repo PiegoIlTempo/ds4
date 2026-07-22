@@ -2151,7 +2151,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    if (cfg.dist && cfg.dist->role == DS4_DISTRIBUTED_WORKER) {
+    if (cfg.dist && cfg.dist->role != DS4_DISTRIBUTED_NONE) {
         ds4_dist_generation_options dist_gen = {
             .prompt = cfg.gen.prompt,
             .system = cfg.gen.system,

@@ -3867,9 +3867,15 @@ static int dist_run_coordinator_generation(
     char err[256];
     ds4_dist_route_plan plan;
     uint64_t plan_generation = 0;
-    if (!dist_coordinator_ensure_route(state, &plan, &plan_generation, err, sizeof(err))) {
-        fprintf(stderr, "ds4: distributed coordinator: %s\n", err);
-        return 1;
+    int route_retries = 0;
+    while (!dist_coordinator_ensure_route(state, &plan, &plan_generation, err, sizeof(err))) {
+        if (route_retries >= 30) {
+            fprintf(stderr, "ds4: distributed coordinator: %s\n", err);
+            return 1;
+        }
+        if (route_retries == 0) fprintf(stderr, "ds4: distributed coordinator: waiting for workers...\n");
+        route_retries++;
+        sleep(1);
     }
 
     ds4_session *session = NULL;
