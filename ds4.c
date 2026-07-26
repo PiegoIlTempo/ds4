@@ -486,6 +486,7 @@ typedef enum {
     DS4_VARIANT_FLASH = 0,
     DS4_VARIANT_PRO   = 1,
     DS4_VARIANT_GLM52 = 2,
+    DS4_VARIANT_SPARK = 3,
 } ds4_variant;
 
 typedef struct {
@@ -548,6 +549,44 @@ static const ds4_shape DS4_SHAPE_FLASH = {
     .n_lora_q = 1024,
     .n_lora_o = 1024,
     .n_expert = 256,
+    .n_expert_used = 6,
+    .n_expert_shared = 1,
+    .n_ff_exp = 2048,
+    .n_hash_layer = 3,
+    .n_swa = 128,
+    .n_indexer_head = 64,
+    .n_indexer_head_dim = 128,
+    .n_indexer_top_k = 512,
+    .n_hc = 4,
+    .n_hc_sinkhorn_iter = 20,
+    .rms_eps = DS4_DEFAULT_RMS_EPS,
+    .hc_eps = DS4_DEFAULT_HC_EPS,
+    .expert_weight_scale = 1.5f,
+    .swiglu_clamp_exp = DS4_DEFAULT_SWIGLU_CLAMP_EXP,
+    .rope_freq_base = DS4_DEFAULT_ROPE_FREQ_BASE,
+    .rope_scale_factor = DS4_DEFAULT_ROPE_SCALE_FACTOR,
+    .rope_yarn_beta_fast = DS4_DEFAULT_ROPE_YARN_BETA_FAST,
+    .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
+    .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
+    .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
+};
+
+static const ds4_shape DS4_SHAPE_SPARK = {
+    .name = "DeepSeek V4 Flash Spark",
+    .family = DS4_MODEL_FAMILY_DEEPSEEK4,
+    .variant = DS4_VARIANT_SPARK,
+    .n_layer = 43,
+    .n_embd = 4096,
+    .n_vocab = 129280,
+    .n_head = 64,
+    .n_head_kv = 1,
+    .n_head_dim = 512,
+    .n_value_dim = 512,
+    .n_rot = 64,
+    .n_out_group = 8,
+    .n_lora_q = 1024,
+    .n_lora_o = 1024,
+    .n_expert = 160,
     .n_expert_used = 6,
     .n_expert_shared = 1,
     .n_ff_exp = 2048,
@@ -1067,6 +1106,7 @@ static uint32_t ds4_expected_layer_compress_ratio(uint32_t il) {
 
     switch (DS4_MODEL_VARIANT) {
     case DS4_VARIANT_FLASH:
+    case DS4_VARIANT_SPARK:
         if (il < 2) return 0;
         return (il & 1u) == 0 ? 4u : 128u;
     case DS4_VARIANT_PRO:
@@ -5401,6 +5441,17 @@ static void ds4_select_shape_from_metadata(
                                    n_indexer_head_dim, n_indexer_top_k, n_hc,
                                    n_hc_sinkhorn_iter)) {
         g_ds4_shape = DS4_SHAPE_FLASH;
+        return;
+    }
+    if (ds4_shape_matches_metadata(&DS4_SHAPE_SPARK,
+                                   n_layer, n_embd, n_vocab, n_head, n_head_kv,
+                                   n_head_dim, n_value_dim, n_rot, n_lora_q,
+                                   n_lora_o, n_out_group, n_expert,
+                                   n_expert_used, n_ff_exp, n_expert_shared,
+                                   n_hash_layer, n_swa, n_indexer_head,
+                                   n_indexer_head_dim, n_indexer_top_k, n_hc,
+                                   n_hc_sinkhorn_iter)) {
+        g_ds4_shape = DS4_SHAPE_SPARK;
         return;
     }
     if (ds4_shape_matches_metadata(&DS4_SHAPE_PRO,
@@ -17628,10 +17679,12 @@ static uint32_t metal_graph_stream_prefill_batch_selected_addr_auto_max(void) {
 #ifdef DS4_ROCM_BUILD
     if (DS4_MODEL_VARIANT == DS4_VARIANT_PRO ||
         DS4_MODEL_VARIANT == DS4_VARIANT_FLASH ||
+        DS4_MODEL_VARIANT == DS4_VARIANT_SPARK ||
         DS4_MODEL_VARIANT == DS4_VARIANT_GLM52) return UINT32_MAX;
 #endif
     if (DS4_MODEL_VARIANT == DS4_VARIANT_PRO) return 800u;
-    if (DS4_MODEL_VARIANT == DS4_VARIANT_FLASH) return 760u;
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_FLASH ||
+        DS4_MODEL_VARIANT == DS4_VARIANT_SPARK) return 760u;
     return 0;
 }
 
@@ -17652,7 +17705,8 @@ static uint32_t metal_graph_stream_prefill_batch_selected_addr_auto_min(void) {
     if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM52) return 2u;
 #endif
     if (DS4_MODEL_VARIANT == DS4_VARIANT_PRO ||
-        DS4_MODEL_VARIANT == DS4_VARIANT_FLASH) return 2u;
+        DS4_MODEL_VARIANT == DS4_VARIANT_FLASH ||
+        DS4_MODEL_VARIANT == DS4_VARIANT_SPARK) return 2u;
     return 0;
 }
 
@@ -29303,7 +29357,8 @@ static bool metal_graph_eval_token_raw_swa(
 
 static bool metal_graph_streaming_decode_prefill_wide_default(
         const ds4_weights *weights) {
-    return DS4_MODEL_VARIANT == DS4_VARIANT_FLASH &&
+    return (DS4_MODEL_VARIANT == DS4_VARIANT_FLASH ||
+           DS4_MODEL_VARIANT == DS4_VARIANT_SPARK) &&
            weights &&
            DS4_N_LAYER > 0 &&
            weights->layer[0].ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
@@ -29334,7 +29389,8 @@ static uint32_t metal_graph_streaming_decode_prefill_max_tokens(
     }
 
     if (DS4_MODEL_VARIANT != DS4_VARIANT_PRO &&
-        DS4_MODEL_VARIANT != DS4_VARIANT_FLASH) {
+        DS4_MODEL_VARIANT != DS4_VARIANT_FLASH &&
+        DS4_MODEL_VARIANT != DS4_VARIANT_SPARK) {
         return 0u;
     }
     return metal_graph_streaming_decode_prefill_wide_default(weights) ? 64u : 18u;
@@ -61103,7 +61159,8 @@ static bool metal_graph_session_batch_attn_pre_supported(
         int count,
         const ds4_weights *weights) {
     if (!items || count < 3 || !weights ||
-        DS4_MODEL_VARIANT != DS4_VARIANT_FLASH ||
+        (DS4_MODEL_VARIANT != DS4_VARIANT_FLASH &&
+            DS4_MODEL_VARIANT != DS4_VARIANT_SPARK) ||
         metal_graph_use_reference_hc_decode() ||
         metal_graph_use_reference_hc_norm_decode()) {
         return false;
