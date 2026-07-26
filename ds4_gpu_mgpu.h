@@ -204,6 +204,7 @@ int ds4_gpu_tensor_device(const ds4_gpu_tensor *t);
  * (follow-up) is its first caller. */
 int ds4_gpu_set_current_device(int logical_tier);
 int ds4_gpu_set_current_device_fenced(int logical_tier);
+int ds4_gpu_force_set_current_device(int logical_tier);
 
 /* Register the mmap'd host model pointer for selective-cache lookups
  * WITHOUT triggering any device-side copy. This bypasses the

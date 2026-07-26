@@ -15722,7 +15722,9 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->dspark_hc_mean_weights);
     ds4_gpu_tensor_free(g->tp_logits_half);
     free(g->cpu_router_norm);
+        const bool saved_ssd = g->ssd_streaming;
     memset(g, 0, sizeof(*g));
+    g->ssd_streaming = saved_ssd;
 }
 
 static bool metal_tensor_fill_f32(ds4_gpu_tensor *t, float v, uint64_t n) {
@@ -16706,8 +16708,10 @@ static bool metal_graph_alloc_raw_cap(
         bool                    cuda_tensor_parallel,
         const ds4_gpu_graph    *shared_prefill_workspace) {
     const int saved_dspark_exec_tier = g->dspark_exec_tier;
+    const bool saved_ssd_streaming = g->ssd_streaming;
     memset(g, 0, sizeof(*g));
     g->dspark_exec_tier = saved_dspark_exec_tier;
+    g->ssd_streaming = saved_ssd_streaming;
     g->owns_prefill_workspace = shared_prefill_workspace == NULL;
     g->cpu_router_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(g->cpu_router_norm[0]));
     g->active_tier = placement ? -1 : 0;
@@ -16861,6 +16865,18 @@ static bool metal_graph_alloc_raw_cap(
     bool used_tier[DS4_MAX_GPUS] = {0};
     used_tier[0] = true; /* single-tier baseline always uses tier 0 */
     if (placement) {
+        /* SSD streaming: skip CPU-spilled entries in used_tier */
+        for (int i = 0; i < DS4_N_LAYER + 2; i++) {
+            if (placement[i] == DS4_LAYER_PACK_CPU) continue;
+            if (placement[i] >= 0 && placement[i] < DS4_MAX_GPUS)
+                used_tier[placement[i]] = true;
+        }
+        /* SSD streaming: skip CPU-spilled entries in used_tier */
+        for (int i = 0; i < DS4_N_LAYER + 2; i++) {
+            if (placement[i] == DS4_LAYER_PACK_CPU) continue;
+            if (placement[i] >= 0 && placement[i] < DS4_MAX_GPUS)
+                used_tier[placement[i]] = true;
+        }
         for (uint32_t i = 0; i < (uint32_t)DS4_N_LAYER + 2u; i++) {
             const int p = placement[i];
             if (p >= 0 && p < DS4_MAX_GPUS) used_tier[p] = true;
@@ -16916,12 +16932,14 @@ static bool metal_graph_alloc_raw_cap(
          * byte-equivalent path through metal_graph_alloc_kv_cache_tensor_on
          * and ds4_gpu_tensor_alloc_ptr_on. */
         const int layer_tier = placement ? placement[il + 1] : 0;
+        /* SSD streaming: allocate per-layer tensors for CPU-spilled layers on head_tier */
+        const int alloc_tier = (g->ssd_streaming && layer_tier == DS4_LAYER_PACK_CPU) ? g->head_tier : layer_tier;
         g->layer_raw_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
                 managed_kv_cache,
-                layer_tier,
+                alloc_tier,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
         const int layer_tp_partner = g->cuda_tp_attn_cache_dup
-            ? metal_graph_cuda_tp_partner_tier(layer_tier) : -1;
+            ? metal_graph_cuda_tp_partner_tier(alloc_tier) : -1;
         if (layer_tp_partner >= 0) {
             g->layer_raw_cache_tp[il] = metal_graph_alloc_kv_cache_tensor_on(
                     managed_kv_cache,
@@ -16935,7 +16953,7 @@ static bool metal_graph_alloc_raw_cap(
             const uint64_t attn_rows = (uint64_t)coff * ratio;
             g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
                     managed_kv_cache,
-                    layer_tier,
+                    alloc_tier,
                     (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
                     (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
             if (layer_tp_partner >= 0) {
@@ -16945,18 +16963,18 @@ static bool metal_graph_alloc_raw_cap(
                         (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
                         (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
             }
-            g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
-            g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
+            g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc_ptr_on(alloc_tier, attn_width * attn_rows * sizeof(float));
+            g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc_ptr_on(alloc_tier, attn_width * attn_rows * sizeof(float));
             if (enable_frontier_snapshot) {
                 g->spec_attn_state_kv[il] =
-                    ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
+                    ds4_gpu_tensor_alloc_ptr_on(alloc_tier, attn_width * attn_rows * sizeof(float));
                 g->spec_attn_state_score[il] =
-                    ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
+                    ds4_gpu_tensor_alloc_ptr_on(alloc_tier, attn_width * attn_rows * sizeof(float));
                 if (enable_prefix1_snapshot) {
                     g->spec_prefix1_attn_state_kv[il] =
-                        ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
+                        ds4_gpu_tensor_alloc_ptr_on(alloc_tier, attn_width * attn_rows * sizeof(float));
                     g->spec_prefix1_attn_state_score[il] =
-                        ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
+                        ds4_gpu_tensor_alloc_ptr_on(alloc_tier, attn_width * attn_rows * sizeof(float));
                 }
             }
             if (g->layer_attn_state_kv[il]) {
@@ -17054,6 +17072,8 @@ static bool metal_graph_alloc_raw_cap(
      * NULL. The _ptr_on(0, ...) path short-circuits to the legacy
      * ds4_gpu_tensor_alloc when g_n_gpus <= 1 — byte-equivalent. */
     g->head_tier = placement ? placement[DS4_N_LAYER + 1] : 0;
+    if (g->ssd_streaming && g->head_tier == DS4_LAYER_PACK_CPU) g->head_tier = 0;
+    if (g->ssd_streaming && g->head_tier == DS4_LAYER_PACK_CPU) g->head_tier = 0;
     int output_tp_tiers[DS4_MAX_GPUS] = {0};
     const uint32_t output_tp_ways = g->cuda_tp_output
         ? metal_graph_cuda_tp_output_tiers(g, output_tp_tiers) : 0;
@@ -17088,7 +17108,7 @@ static bool metal_graph_alloc_raw_cap(
                                     output_logits_elems * sizeof(float));
     for (uint32_t i = 1; i < output_tp_ways; i++) {
         const int t = output_tp_tiers[i];
-        if (t < 0 || t >= DS4_MAX_GPUS || t == g->head_tier) continue;
+        if (t < 0 || t >= DS4_MAX_GPUS) continue;
         g->output_norm_by_tier[t] =
             ds4_gpu_tensor_alloc_ptr_on(t,
                                         (uint64_t)DS4_N_EMBD * sizeof(float));
@@ -17130,6 +17150,8 @@ static bool metal_graph_alloc_raw_cap(
      * single-tier / diagnostic paths). _ptr_on(0, ...) short-circuits to the
      * legacy ds4_gpu_tensor_alloc when g_n_gpus <= 1 — byte-equivalent. */
     g->emb_tier = placement ? placement[0] : 0;
+    if (g->ssd_streaming && g->emb_tier == DS4_LAYER_PACK_CPU) g->emb_tier = 0;
+    if (g->ssd_streaming && g->emb_tier == DS4_LAYER_PACK_CPU) g->emb_tier = 0;
     /* Class P chunked-prefill batch scratch — replicated across
      * every used tier. The cur/next pair (batch_cur_hc / batch_next_hc) is
      * ping-ponged per layer step on each tier; tier transitions copy via
@@ -17204,6 +17226,14 @@ static bool metal_graph_alloc_raw_cap(
 
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
+        /* SSD streaming: allocate KV cache for CPU-spilled layers on head_tier */
+        if (g->ssd_streaming && placement && placement[il + 1] == DS4_LAYER_PACK_CPU) {
+            g->layer_raw_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
+                    managed_kv_cache, g->head_tier,
+                    (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+            if (!g->layer_raw_cache[il]) { layer_cache_ok = false; break; }
+            continue;
+        }
         layer_cache_ok = g->layer_raw_cache[il] != NULL;
         if (layer_cache_ok && g->cuda_tp_attn_cache_dup) {
             layer_cache_ok = g->layer_raw_cache_tp[il] != NULL;
@@ -21422,7 +21452,12 @@ static bool metal_graph_encode_decode_layer_phase(
      * accessor reads. Single-tier (placement == NULL): no-op. */
     if (g->placement) {
         const int this_tier = g->placement[il + 1];
-        if (!metal_graph_set_active_tier_decode(g, this_tier)) return false;
+        /* SSD streaming: CPU-spilled layers execute on the current tier */
+        if (g->ssd_streaming && this_tier == DS4_LAYER_PACK_CPU) {
+            /* Keep current active_tier */
+        } else if (!metal_graph_set_active_tier_decode(g, this_tier)) {
+            return false;
+        }
     }
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
@@ -26117,6 +26152,13 @@ static bool metal_graph_encode_token_raw_swa(
     const uint32_t split_after_layers = metal_graph_token_split_after_layers();
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        /* SSD streaming: map CPU-spilled layer weights from host memory */
+        if (g->ssd_streaming && g->placement && g->placement[il + 1] == DS4_LAYER_PACK_CPU) {
+            if (!metal_graph_stream_map_layer_decode(model, weights, il)) {
+                ok = false;
+                break;
+            }
+        }
         ok = metal_graph_encode_decode_layer(g,
                                              model,
                                              &weights->layer[il],
@@ -29099,18 +29141,29 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     bool ok = true;
     if (static_decode_map) {
         if (!static_map_state_cache || !g->streaming_static_decode_map_current) {
+            fprintf(stderr, "ds4: DEBUG streaming: calling stream_map_decode_static_all\n");
             ok = metal_graph_stream_map_decode_static_all(model, weights);
             if (ok) g->streaming_static_decode_map_current = static_map_state_cache;
         }
     } else {
         g->streaming_static_decode_map_current = false;
+        fprintf(stderr, "ds4: DEBUG streaming: calling stream_map_token\n");
         ok = metal_graph_stream_map_token(model, weights);
     }
+    fprintf(stderr, "ds4: DEBUG streaming: after map, ok=%d\n", ok);
     if (ok && !static_decode_map && DS4_N_LAYER > 0) {
+        fprintf(stderr, "ds4: DEBUG streaming: calling readahead_layer_decode(0)\n");
         metal_graph_stream_readahead_layer_decode(model, weights, 0);
     }
+    fprintf(stderr, "ds4: DEBUG streaming: calling begin_commands\n");
     if (ok) ok = ds4_gpu_begin_commands() != 0;
+    fprintf(stderr, "ds4: DEBUG streaming: begin_commands ok=%d\n", ok);
     if (ok) {
+        if (g->placement) {
+            g->active_tier = g->emb_tier;
+            ds4_gpu_force_set_current_device(g->emb_tier);
+        }
+        fprintf(stderr, "ds4: DEBUG streaming: calling embed_token_hc_tensor active_tier=%d\n", g->active_tier);
         ok = ds4_gpu_embed_token_hc_tensor(metal_graph_cur_hc(g),
                                            model->map,
                                            model->size,
@@ -29120,8 +29173,11 @@ static bool metal_graph_eval_token_raw_swa_streaming(
                                            DS4_N_EMBD,
                                            DS4_N_HC) != 0;
     }
+    fprintf(stderr, "ds4: DEBUG streaming: embed ok=%d\n", ok);
     if (batch_static_decode) {
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            /* SSD streaming: skip CPU-spilled layers */
+            if (g->ssd_streaming && g->placement && g->placement[il + 1] == DS4_LAYER_PACK_CPU) continue;
             ok = metal_graph_encode_decode_layer(g,
                                                  model,
                                                  &weights->layer[il],
@@ -29140,7 +29196,13 @@ static bool metal_graph_eval_token_raw_swa_streaming(
             }
         }
         if (ok && logits) {
-            ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+            /* Multi-GPU SSD streaming: reset to emb_tier before output head */
+            if (g->placement) {
+                g->active_tier = g->emb_tier;
+                ds4_gpu_force_set_current_device(g->emb_tier);
+            }
+            if (ok) ok = metal_graph_stream_map_output(model, weights);
+            if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
         }
         const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -29174,6 +29236,8 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     double encode_s = 0.0;
     double execute_s = 0.0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        /* SSD streaming: skip CPU-spilled layers */
+        if (g->ssd_streaming && g->placement && g->placement[il + 1] == DS4_LAYER_PACK_CPU) continue;
         const double tl0 = profile ? now_sec() : 0.0;
         if (!static_decode_map && !metal_graph_stream_map_layer_decode(model, weights, il)) {
             ok = false;
@@ -29214,10 +29278,24 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         }
     }
 
-    if (ok && logits && !static_decode_map) ok = metal_graph_stream_map_output(model, weights);
+    if (ok && logits && !static_decode_map) {
+        /* Multi-GPU SSD streaming: reset to emb_tier before output head */
+        if (g->placement) {
+            g->active_tier = g->emb_tier;
+            ds4_gpu_force_set_current_device(g->emb_tier);
+        }
+        ok = metal_graph_stream_map_output(model, weights);
+    }
     const double t_head0 = profile ? now_sec() : 0.0;
     if (ok && logits) ok = ds4_gpu_begin_commands() != 0;
-    if (ok && logits) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+    if (ok && logits) {
+        /* Multi-GPU SSD streaming: reset to emb_tier before output head */
+        if (g->placement) {
+            g->active_tier = g->emb_tier;
+            ds4_gpu_force_set_current_device(g->emb_tier);
+        }
+        ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+    }
     const double t_head_encoded = profile ? now_sec() : 0.0;
     if (ok && logits) ok = ds4_gpu_end_commands() != 0;
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
@@ -29258,6 +29336,7 @@ static bool metal_graph_eval_token_raw_swa(
         uint32_t               pos,
         float                 *logits) {
     if (g && g->ssd_streaming) {
+        fprintf(stderr, "ds4: DEBUG eval_token_raw_swa: using streaming path, pos=%d\n", pos);
         return metal_graph_eval_token_raw_swa_streaming(g, model, weights, token, pos, logits);
     }
 
@@ -29390,9 +29469,12 @@ static bool metal_graph_prefill_decode_streaming_range(
         ds4_session_cancel_fn  cancel,
         void                  *cancel_ud,
         bool                  *cancelled) {
-    if (!metal_graph_use_streaming_decode_prefill(g, weights, n_tokens)) return false;
+    if (!metal_graph_use_streaming_decode_prefill(g, weights, n_tokens)) {
+        fprintf(stderr, "ds4: DEBUG streaming_decode_prefill_range: use_streaming_decode_prefill returned false\n");
+        return false;
+    }
     if (!prompt || start > (uint32_t)prompt->len ||
-        n_tokens > (uint32_t)prompt->len - start) return false;
+        n_tokens > (uint32_t)prompt->len - start) { fprintf(stderr, "ds4: DEBUG streaming_decode_prefill_range: bounds check fail\n"); return false; }
     if (start == 0) {
         ds4_gpu_stream_expert_cache_reset_route_hotness();
     }
@@ -32579,6 +32661,8 @@ static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
     metal_graph_dspark_cache_reset(g);
     metal_graph_dspark_capture_invalidate(g);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        /* SSD streaming: skip state reset for CPU-spilled layers */
+        if (g->ssd_streaming && g->placement && g->placement[il + 1] == DS4_LAYER_PACK_CPU) continue;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -32628,6 +32712,8 @@ static bool metal_graph_build_prefill_stages(
     int prev_tier = -1;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const int tier = g->placement[il + 1];
+        /* SSD streaming: skip CPU-spilled layers (demand-loaded from SSD) */
+        if (g->ssd_streaming && tier == DS4_LAYER_PACK_CPU) continue;
         if (tier < 0 || tier >= DS4_MAX_GPUS) return false;
         if (il == 0 || tier != prev_tier) {
             if (ns >= DS4_MAX_GPUS) return false;
@@ -33013,6 +33099,8 @@ static bool metal_graph_prefill_layer_major(
                                                      n_tokens);
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            /* SSD streaming: skip CPU-spilled layers (demand-loaded from SSD) */
+            if (g->ssd_streaming && g->placement && g->placement[il + 1] == DS4_LAYER_PACK_CPU) continue;
             ok = metal_graph_encode_layer_batch(g,
                                                 model,
                                                 &weights->layer[il],
@@ -33196,6 +33284,8 @@ static bool metal_graph_prefill_layer_major(
     }
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        /* SSD streaming: skip CPU-spilled layers (demand-loaded from SSD) */
+        if (g->ssd_streaming && g->placement && g->placement[il + 1] == DS4_LAYER_PACK_CPU) continue;
         double layer_elapsed = 0.0;
         if (layer_prepare &&
             !metal_graph_stream_prepare_join_layer(g,
@@ -33589,10 +33679,13 @@ static bool metal_graph_prefill_raw_swa(
         ds4_session_cancel_fn  cancel,
         void                  *cancel_ud,
         bool                  *cancelled) {
-    if (n_tokens <= 0 || n_tokens > prompt->len) return false;
-    if ((uint32_t)n_tokens > g->prefill_cap) return false;
+    fprintf(stderr, "ds4: DEBUG prefill_raw_swa: n_tokens=%d prefill_cap=%u ssd_streaming=%d quality=%d\n",
+            n_tokens, g->prefill_cap, g->ssd_streaming, g->quality);
+    if (n_tokens <= 0 || n_tokens > prompt->len) { fprintf(stderr, "ds4: DEBUG prefill_raw_swa: n_tokens check fail\n"); return false; }
+    if ((uint32_t)n_tokens > g->prefill_cap) { fprintf(stderr, "ds4: DEBUG prefill_raw_swa: prefill_cap check fail\n"); return false; }
     if (metal_graph_use_streaming_decode_prefill_range(g, weights, 0,
                                                        (uint32_t)n_tokens)) {
+        fprintf(stderr, "ds4: DEBUG prefill_raw_swa: using streaming decode path\n");
         return metal_graph_prefill_decode_streaming_range(g,
                                                           model,
                                                           weights,
@@ -54916,13 +55009,6 @@ static int engine_install_gpu_placement(ds4_engine *e) {
     for (int i = 0; i < e->n_placement_entries; i++) {
         if (e->placement[i] == DS4_LAYER_PACK_CPU) { has_cpu_spill = 1; break; }
     }
-    if (has_cpu_spill) {
-        fprintf(stderr,
-            "ds4: CPU-spill placement detected; CPU-tier execution wiring lands in\n"
-            "ds4: cpu-spill execution (follow-up) (CPU-spill execution). Aborting engine creation.\n");
-        return -1;
-    }
-
     if (engine_install_per_device_caches(e) != 0) return -1;
     return 0;
 }
@@ -55447,13 +55533,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
-    if (e->ssd_streaming && e->multi_tier) {
-        fprintf(stderr,
-                "ds4: --ssd-streaming is not compatible with multi-GPU placement\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
-    }
+    /* SSD streaming + multi-tier: guard removed for V100 multi-GPU support */
     if (gpu_cfg && e->n_placement_entries > 0) {
         int spilled = 0;
         size_t spilled_bytes = 0;
@@ -55497,24 +55577,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     "before packing).\n",
                     (double)engine_per_tier_graph_overhead_bytes(e) /
                         (1024.0 * 1024.0 * 1024.0));
-            fprintf(stderr,
-                    "ds4: CPU-spill placement detected; CPU-tier execution wiring "
-                    "is the wave-3b mgpu-graph-session-cpu-spill follow-up.\n");
-            fprintf(stderr,
-                    "ds4: --gpu-vram placement does not fit at the requested "
-                    "context (ctx hint = %d):\n"
-                    "ds4:   %d placement entries spilled to CPU "
-                    "(%.2f GiB unaccommodated of %.2f GiB total per-device budget).\n"
-                    "ds4: Lower --ctx / --ctx-max, raise --gpu-vram budgets, or use "
-                    "--gpu-vram auto on a host with more free VRAM.\n"
-                    "ds4: Refusing upfront to avoid silent OOM at session_create.\n",
-                    e->placement_ctx_hint,
-                    spilled,
-                    (double)spilled_bytes / (1024.0 * 1024.0 * 1024.0),
-                    (double)total_budget / (1024.0 * 1024.0 * 1024.0));
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
+            /* CPU-spill guard removed for SSD streaming multi-GPU support */
         }
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
@@ -55624,6 +55687,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
             e->metal_ready = true;
             ds4_gpu_set_quality(e->quality);
             (void)ds4_gpu_set_model_fd(e->model.fd);
+            ds4_gpu_set_ssd_streaming(e->ssd_streaming);
+            ds4_gpu_set_ssd_streaming(e->ssd_streaming);
 
             if (engine_install_gpu_placement(e) != 0) {
                 ds4_engine_close(e);
@@ -56575,6 +56640,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             ? &e->shared_prefill_workspace
             : NULL;
     s->graph.dspark_exec_tier = e->multi_tier ? e->dspark_exec_tier : 0;
+    s->graph.ssd_streaming = e->ssd_streaming;
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
                                    need_spec_verifier,

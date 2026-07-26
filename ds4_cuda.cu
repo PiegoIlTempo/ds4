@@ -759,13 +759,10 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
         dev_ptr) {
         return (const char *)dev_ptr;
     }
-    fprintf(stderr,
-        "ds4: selective-cache miss for offset=%llu bytes=%llu on "
-        "logical_tier=%d (physical_device=%d, current_device=%d, "
-        "label=%s); this is a placement/cache-install bug\n",
-        (unsigned long long)offset, (unsigned long long)bytes,
-        logical_tier, physical_device, cur_dev, label ? label : "?");
-    return NULL;
+    /* Multi-GPU SSD streaming: fall back to host-mapped range when the
+     * selective cache doesn't have this tensor (e.g. CPU-spilled output
+     * head tensors that were never cached on any GPU). */
+    return cuda_model_range_ptr(model_map, offset, bytes, label);
 }
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
@@ -3287,6 +3284,19 @@ extern "C" int ds4_gpu_set_current_device(int logical_tier) {
     if (!g_cuda_no_setdevice_cache && g_current_logical_tier == logical_tier) {
         return 0;
     }
+    if (cudaSetDevice(g_gpu[logical_tier].device_id) == cudaSuccess) {
+        g_current_logical_tier = logical_tier;
+        return 0;
+    }
+    g_current_logical_tier = -1;
+    return -1;
+}
+
+/* Force a CUDA device switch, bypassing the g_current_logical_tier cache.
+ * Used by multi-GPU SSD streaming to reset the device after per-layer decode
+ * pipelines leave the actual device on a different GPU. */
+extern "C" int ds4_gpu_force_set_current_device(int logical_tier) {
+    if (logical_tier < 0 || logical_tier >= g_n_gpus) return -1;
     if (cudaSetDevice(g_gpu[logical_tier].device_id) == cudaSuccess) {
         g_current_logical_tier = logical_tier;
         return 0;
@@ -20879,12 +20889,11 @@ static int routed_moe_launch(
         g_stream_selected_cache.slot_selected_tensor.ptr &&
         g_stream_selected_cache.slot_selected_tensor.bytes >=
             required_slot_count * sizeof(int32_t);
+    /* Multi-GPU SSD streaming: if the per-tier cache doesn't match, fall through
+     * to the non-cached cuda_resolve_weight_ptr path instead of failing. */
     if (g_ssd_streaming_mode && allow_streaming &&
         !use_stream_selected_cache) {
-        fprintf(stderr,
-                "ds4: CUDA streaming selected experts are unavailable for layer %u\n",
-                layer_index);
-        return 0;
+        /* Fall through to non-cached path below */
     }
     if (use_stream_selected_cache) {
         selected = &g_stream_selected_cache.slot_selected_tensor;
@@ -22960,11 +22969,7 @@ static int cuda_stream_selected_cache_begin_load(
         slot_count == 0) {
         return 0;
     }
-    if (g_n_gpus != 1) {
-        fprintf(stderr,
-                "ds4: CUDA SSD streaming requires single-GPU placement\n");
-        return 0;
-    }
+    /* Multi-GPU SSD streaming: guard removed for V100 multi-GPU support */
 
     std::vector<int32_t> expert_to_slot;
     std::vector<int32_t> compact_ids;
